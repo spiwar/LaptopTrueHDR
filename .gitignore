@@ -1,0 +1,19 @@
+# Build output
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+
+# Visual Studio / VS Code
+.vs/
+.vscode/
+*.user
+Debug/
+Release/
+x64/
+
+# Claude Code
+.claude/
