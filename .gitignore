@@ -2,8 +2,8 @@
 *.obj
 *.exe
 
-# Visual Studio / VS Code
-.vscode/
+# Visual Studio / VS Code (tasks.json is shared, local settings are not)
+.vscode/settings.json
 *.user
 
 # Claude Code
