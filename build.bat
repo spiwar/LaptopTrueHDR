@@ -9,15 +9,7 @@ REM Skip the toolchain lookup if we are already in a developer prompt.
 if defined VSINSTALLDIR goto :compile
 
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-if not exist "%VSWHERE%" (
-    echo [-] vswhere.exe not found. Is Visual Studio installed?
-    exit /b 1
-)
-
-REM Read vswhere's output via a temp file. A `for /f` backtick command would be
-REM parsed wrong here: the ")" in "%ProgramFiles(x86)%" closes the "in (...)"
-REM group early, silently leaving the wrong compiler on PATH.
-"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > "%TEMP%\vspath.txt"
+"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > "%TEMP%\vspath.txt" 2>nul
 set "VSPATH="
 set /p VSPATH=<"%TEMP%\vspath.txt"
 del "%TEMP%\vspath.txt" 2>nul
@@ -30,10 +22,6 @@ REM stderr is discarded: vcvars64.bat prints a harmless "vswhere.exe is not
 REM recognized" on some installs while still configuring the environment
 REM correctly. The "where cl" check below is what actually verifies it worked.
 call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>nul
-if errorlevel 1 (
-    echo [-] Failed to initialize the VC++ environment.
-    exit /b 1
-)
 
 :compile
 where cl >nul 2>nul
@@ -44,19 +32,10 @@ if errorlevel 1 (
 
 cd /d "%~dp0"
 
-REM /std:c++17   minimum required by C++/WinRT
-REM /EHsc        standard C++ exception model
-REM /permissive- strict conformance, recommended for C++/WinRT
-REM /MT          static CRT, so the exe runs without the VC++ redistributable
+REM /MT links the CRT statically, so the exe runs without the VC++ redistributable.
 cl /nologo /W3 /O2 /MT /std:c++17 /EHsc /permissive- ^
    main.cpp ^
    /Fe:hdr-laptop-calibration.exe
-if errorlevel 1 (
-    echo.
-    echo [-] Build failed.
-    exit /b 1
-)
+if errorlevel 1 exit /b 1
 
-echo.
 echo [+] Build succeeded: hdr-laptop-calibration.exe
-endlocal
