@@ -61,6 +61,7 @@ If it doesn't work, then your system brightness is too low, the program will tel
   run the tool again.
 - In games that let you set peak brightness, use the **FINAL ADJUSTED VALUE** the tool
   prints.
+- WON'T WORK IF YOU'VE USED "WINDOWS HDR CALIBRATION", DELETE ALL PROFILES CREATED BY THAT THING
 
 
 ## Known issues
