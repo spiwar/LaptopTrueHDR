@@ -1,4 +1,4 @@
-# HDR Laptop Calibration
+# LaptopTrueHDR
 
 Automatic HDR calibration tool for **laptop internal displays only**.
 
