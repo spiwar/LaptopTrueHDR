@@ -36,11 +36,10 @@ Rinse and repeat until your base = adjusted. Doing this manually will take a lot
 
 ## Usage
 
-1. Set your system brightness to maximum.
-2. Run the tool.
-3. It just works.
+1. Run the tool.
+2. It just works.
 
-If it doesn't work, then your system brightness is too low, the program will tell you that
+If it doesn't work, then your system brightness is too low (or high), the program will tell you that. See additional notes below.
 
 ## How it works
 
@@ -54,7 +53,7 @@ If it doesn't work, then your system brightness is too low, the program will tel
 
 ## Notes
 
-- Afterwards, check your Windows "HDR content brightness" value. It now shows the best
+- After running the tool, check your Windows "HDR content brightness" value. It now shows the best
   setting for your current system brightness. **Remember that system brightness + HDR
   content brightness combo.** That's where your screen is most accurate.
 - Want a brighter or dimmer desktop? Use whatever system brightness you like and just
