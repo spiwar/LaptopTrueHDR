@@ -1300,6 +1300,8 @@ static std::wstring ExePath() {
     return (n > 0 && n < MAX_PATH) ? std::wstring(buf, n) : L"";
 }
 
+static bool IsWatcherRunning();
+
 static int RunInstall() {
     std::wstring exe = ExePath();
     if (exe.empty()) {
@@ -1314,7 +1316,24 @@ static int RunInstall() {
         return ExitGeneric;
     }
     std::wcout << L"[+] Watcher installed. It will start at logon:\n    " << value << L"\n";
-    std::wcout << L"    Start it now without logging off: run the same command manually.\n";
+
+    if (IsWatcherRunning()) {
+        std::wcout << L"[*] Watcher is already running.\n";
+        return ExitOk;
+    }
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    std::wstring cmdline = L"\"" + exe + L"\" --watch";
+    if (CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        std::wcout << L"[+] Watcher started and watching.\n";
+    } else {
+        std::wcout << L"[!] Could not start the watcher now (error " << GetLastError() << L").\n";
+        std::wcout << L"    It will start at your next logon.\n";
+    }
     return ExitOk;
 }
 
@@ -1414,7 +1433,7 @@ static int RunHelp() {
     std::wcout << L"  --apply             Apply the saved profile for the current brightness.\n";
     std::wcout << L"  --watch             Run the background watcher (re-applies HDR brightness\n";
     std::wcout << L"                      when system brightness changes).\n";
-    std::wcout << L"  --install           Start the watcher automatically at logon.\n";
+    std::wcout << L"  --install           Start the watcher now and automatically at logon.\n";
     std::wcout << L"  --uninstall         Remove the autostart entry.\n";
     std::wcout << L"  --status            Show profile, panel, autostart and watcher state.\n";
     std::wcout << L"  --dry-run           With map/quick/apply: report without changing anything.\n";
