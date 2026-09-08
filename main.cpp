@@ -74,10 +74,6 @@ enum ExitCode {
     ExitDisplayError = 5,
 };
 
-struct Options {
-    bool dryRun = false;
-};
-
 // ---------------------------------------------------------------------------
 // Small utilities
 // ---------------------------------------------------------------------------
@@ -632,12 +628,7 @@ static LONG WriteSDRWhiteLevel(LUID adapterId, UINT32 targetId, int nits) {
     return DisplayConfigSetDeviceInfo(&sdrWhiteParams.header);
 }
 
-static bool WriteAndVerify(const DisplayContext& ctx, int nits, int* appliedNits, const Options& opt) {
-    if (opt.dryRun) {
-        std::wcout << L"  [dry-run] Would set HDR content brightness to " << nits << L" nits\n";
-        if (appliedNits) *appliedNits = nits;
-        return true;
-    }
+static bool WriteAndVerify(const DisplayContext& ctx, int nits, int* appliedNits) {
     for (int attempt = 0; attempt < 2; attempt++) {
         LONG hr = WriteSDRWhiteLevel(ctx.adapterId, ctx.targetId, nits);
         if (hr != ERROR_SUCCESS) {
@@ -865,14 +856,14 @@ struct BisectResult {
     const wchar_t* note = nullptr;  // floor/ceiling notice, if any
 };
 
-static BisectResult BisectAtCurrentBrightness(const DisplayContext& ctx, const Options& opt) {
+static BisectResult BisectAtCurrentBrightness(const DisplayContext& ctx) {
     BisectResult r;
     const wchar_t* gdi = ctx.desc.DeviceName;
     float base = ctx.baseLevel;
 
     auto probe = [&](int nits) {
         int applied = 0;
-        if (!WriteAndVerify(ctx, nits, &applied, opt)) return 0.0f;
+        if (!WriteAndVerify(ctx, nits, &applied)) return 0.0f;
         Sleep(150);
         float measured = MeasureStableMaxLuminance(gdi);
         std::wcout << L"  Testing Slider: " << nits
@@ -937,7 +928,7 @@ static int CheckHdrForCalibration(const DisplayContext& ctx) {
 }
 
 // --quick: calibrate for the current system brightness only, no profile.
-static int RunQuick(const Options& opt) {
+static int RunQuick() {
     DisplayContext ctx;
     int rc = InitDisplayContext(&ctx, false);
     if (rc) return rc;
@@ -946,7 +937,7 @@ static int RunQuick(const Options& opt) {
 
     PrintHeader(ctx);
 
-    BisectResult r = BisectAtCurrentBrightness(ctx, opt);
+    BisectResult r = BisectAtCurrentBrightness(ctx);
     if (r.failed) {
         std::wcout << L"\n[-] DXGI stopped reporting a luminance value. Aborting.\n";
         return ExitGeneric;
@@ -955,7 +946,7 @@ static int RunQuick(const Options& opt) {
     else std::wcout << L"\n[*] Optimal value identified for current system brightness.\n";
 
     int applied = 0;
-    if (!WriteAndVerify(ctx, r.bestNits, &applied, opt)) {
+    if (!WriteAndVerify(ctx, r.bestNits, &applied)) {
         std::wcout << L"[-] Failed to set the final slider value.\n";
         return ExitWriteFailed;
     }
@@ -973,7 +964,7 @@ static int RunQuick(const Options& opt) {
 }
 
 // --map (default): calibrate the whole brightness range and save the profile.
-static int RunMap(const Options& opt) {
+static int RunMap() {
     DisplayContext ctx;
     int rc = InitDisplayContext(&ctx, false);
     if (rc) return rc;
@@ -990,7 +981,6 @@ static int RunMap(const Options& opt) {
 
     PrintHeader(ctx);
     std::wcout << L"[Current System Brightness]        : " << originalPct << L"%\n";
-    if (opt.dryRun) std::wcout << L"[dry-run] No changes will be made.\n";
     std::wcout << L"[*] Calibrating at system brightness anchors: 10/30/50/70/90%.\n\n";
 
     Profile profile;
@@ -1001,17 +991,15 @@ static int RunMap(const Options& opt) {
 
     bool brightnessChanged = false;
     for (int pct : kAnchorPcts) {
-        if (!opt.dryRun) {
-            if (!brightness.SetPct(pct) || !WaitBrightness(brightness, pct)) {
-                std::wcout << L"[-] Could not set system brightness to " << pct << L"%. Aborting.\n";
-                rc = ExitGeneric;
-                break;
-            }
-            brightnessChanged = true;
-            Sleep(300);  // panel transition
+        if (!brightness.SetPct(pct) || !WaitBrightness(brightness, pct)) {
+            std::wcout << L"[-] Could not set system brightness to " << pct << L"%. Aborting.\n";
+            rc = ExitGeneric;
+            break;
         }
+        brightnessChanged = true;
+        Sleep(300);  // panel transition
         std::wcout << L"[System Brightness " << pct << L"%]\n";
-        BisectResult r = BisectAtCurrentBrightness(ctx, opt);
+        BisectResult r = BisectAtCurrentBrightness(ctx);
         if (r.failed) {
             std::wcout << L"[-] Measurement failed at " << pct << L"% brightness. Aborting.\n";
             rc = ExitGeneric;
@@ -1030,11 +1018,6 @@ static int RunMap(const Options& opt) {
     }
     if (rc) return rc;
 
-    if (opt.dryRun) {
-        std::wcout << L"[dry-run] Would save the profile to " << ProfilePath() << L"\n";
-        return ExitOk;
-    }
-
     if (!SaveProfile(profile, ProfilePath())) {
         std::wcout << L"[-] Failed to write the profile to " << ProfilePath() << L"\n";
         return ExitGeneric;
@@ -1043,7 +1026,7 @@ static int RunMap(const Options& opt) {
     // Leave the system at the best pair for the user's current brightness.
     int nits = InterpolateHdrNits(profile.anchors, originalPct);
     int applied = 0;
-    if (WriteAndVerify(ctx, nits, &applied, opt)) {
+    if (WriteAndVerify(ctx, nits, &applied)) {
         std::wcout << L"[*] Applied HDR content brightness for current system brightness ("
                    << originalPct << L"%): " << applied << L" nits\n";
     } else {
@@ -1061,7 +1044,7 @@ static int RunMap(const Options& opt) {
 }
 
 // --apply: load the profile and apply the value for the current brightness.
-static int RunApply(const Options& opt) {
+static int RunApply() {
     Profile profile;
     std::wstring error;
     if (!LoadProfile(ProfilePath(), &profile, &error)) {
@@ -1092,7 +1075,7 @@ static int RunApply(const Options& opt) {
 
     int nits = InterpolateHdrNits(profile.anchors, pct);
     int applied = 0;
-    if (!WriteAndVerify(ctx, nits, &applied, opt)) {
+    if (!WriteAndVerify(ctx, nits, &applied)) {
         std::wcout << L"[-] Failed to set the HDR content brightness.\n";
         return ExitWriteFailed;
     }
@@ -1108,7 +1091,6 @@ static int RunApply(const Options& opt) {
 struct WatchState {
     Profile profile;
     DisplayContext ctx;
-    Options opt;
     Brightness brightness;      // used on the main (message) thread
     HWND hwnd = nullptr;
     int lastBrightnessPct = -1;
@@ -1135,7 +1117,7 @@ static void ApplyFromProfile(const wchar_t* reason) {
 
     int nits = InterpolateHdrNits(s.profile.anchors, pct);
     int applied = 0;
-    if (!WriteAndVerify(s.ctx, nits, &applied, s.opt)) {
+    if (!WriteAndVerify(s.ctx, nits, &applied)) {
         AppendLog(L"[apply] FAILED: slider write did not land (target " + std::to_wstring(nits) + L" nits).");
         return;
     }
@@ -1229,7 +1211,7 @@ static LRESULT CALLBACK WatchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     }
 }
 
-static int RunWatch(const Options& opt) {
+static int RunWatch() {
     HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         AppendLog(L"[watch] another instance is already running; exiting.");
@@ -1256,7 +1238,6 @@ static int RunWatch(const Options& opt) {
     static WatchState state;
     state.profile = profile;
     state.ctx = ctx;
-    state.opt = opt;
     g_watch = &state;
 
     WNDCLASSW wc = {};
@@ -1424,7 +1405,7 @@ static int RunStatus() {
 
 static int RunHelp() {
     std::wcout << L"LaptopTrueHDR — automatic HDR calibration for laptop internal displays.\n\n";
-    std::wcout << L"Usage: hdr-laptop-calibration.exe [mode] [--dry-run]\n\n";
+    std::wcout << L"Usage: hdr-laptop-calibration.exe [mode]\n\n";
     std::wcout << L"  (no args) / --map   Calibrate the whole brightness range (10-90% anchors),\n";
     std::wcout << L"                      save the profile, apply the value for the current\n";
     std::wcout << L"                      system brightness. Takes about a minute; your screen\n";
@@ -1436,7 +1417,6 @@ static int RunHelp() {
     std::wcout << L"  --install           Start the watcher now and automatically at logon.\n";
     std::wcout << L"  --uninstall         Remove the autostart entry.\n";
     std::wcout << L"  --status            Show profile, panel, autostart and watcher state.\n";
-    std::wcout << L"  --dry-run           With map/quick/apply: report without changing anything.\n";
     return ExitOk;
 }
 
@@ -1448,12 +1428,10 @@ int wmain(int argc, wchar_t** argv) {
     _wsetlocale(LC_ALL, L"");
     std::wcout << std::unitbuf;  // keep wcout/wcerr ordering sane when piped
 
-    Options opt;
     std::wstring mode = L"map";
     for (int i = 1; i < argc; i++) {
         std::wstring arg = argv[i];
-        if (arg == L"--dry-run") opt.dryRun = true;
-        else if (arg.rfind(L"--", 0) == 0) mode = arg.substr(2);
+        if (arg.rfind(L"--", 0) == 0) mode = arg.substr(2);
         else mode = arg;
     }
 
@@ -1472,10 +1450,10 @@ int wmain(int argc, wchar_t** argv) {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
 
     int rc = ExitGeneric;
-    if (mode == L"map")          rc = RunMap(opt);
-    else if (mode == L"quick")   rc = RunQuick(opt);
-    else if (mode == L"apply")   rc = RunApply(opt);
-    else if (mode == L"watch")   rc = RunWatch(opt);
+    if (mode == L"map")          rc = RunMap();
+    else if (mode == L"quick")   rc = RunQuick();
+    else if (mode == L"apply")   rc = RunApply();
+    else if (mode == L"watch")   rc = RunWatch();
     else if (mode == L"install") rc = RunInstall();
     else if (mode == L"uninstall") rc = RunUninstall();
     else if (mode == L"status")  rc = RunStatus();
