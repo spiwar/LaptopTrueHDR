@@ -1,5 +1,4 @@
 # LaptopTrueHDR
-
 Automatic HDR calibration tool for **laptop internal displays only**.
 
 
@@ -32,14 +31,30 @@ Rinse and repeat until your base = adjusted. Doing this manually will take a lot
 
 - A laptop with an HDR-capable internal display
 - **HDR enabled** in Windows Display settings
-- **External monitors unplugged** (see [Known issues](#known-issues))
 
 ## Usage
 
-1. Run the tool.
-2. It just works.
+1. Run the tool. The tool will calibrate your **whole brightness range**: your screen steps
+   through several brightness levels and returns to the brightness you had.
+2. Saves the result to a profile:
+   `%LOCALAPPDATA%\LaptopTrueHDR\profile.json`
+3. Run it once more with `--install` if you want the HDR content brightness to stay correct
+   whenever you change system brightness
 
-If it doesn't work, then your system brightness is too low (or high), the program will tell you that. See additional notes below.
+If it doesn't work, the tool will tell you why (HDR off, no brightness controls, profile missing...).
+Use `--dry-run` to check without changing anything.
+
+### All modes
+
+| Command | What it does |
+| --- | --- |
+| *(no args)* / `--map` | Full calibration: bisects the HDR content brightness at several system-brightness anchors, saves the profile, applies the right value for your current brightness. |
+| `--quick` | Calibrate only for the current system brightness (no profile is written). |
+| `--apply` | Re-apply the saved profile's value for the current system brightness. |
+| `--watch` | Background watcher: re-applies the correct HDR content brightness ~2s after your system brightness changes (also after sleep/resume and dock/undock). |
+| `--install` / `--uninstall` | Start/stop the watcher automatically at logon (per-user, no admin). `--install` also starts it immediately. |
+| `--status` | Profile validity, panel identity, autostart state, last applied value. |
+
 
 ## How it works
 
@@ -48,26 +63,20 @@ If it doesn't work, then your system brightness is too low (or high), the progra
    `DisplayMonitor.MaxLuminanceInNits()`.
 3. Reads the **adjusted peak**, what Windows reports through
    `DXGI_OUTPUT_DESC1.MaxLuminance`. This one moves as the slider moves.
-4. Searches for the slider value where `base peak / adjusted peak` is closest to 1.
-
+4. Searches for the slider value where `base peak / adjusted peak` is closest to 1
 
 ## Notes
-
-- After running the tool, check your Windows "HDR content brightness" value. It now shows the best
-  setting for your current system brightness. **Remember that system brightness + HDR
-  content brightness combo.** That's where your screen is most accurate.
-- Want a brighter or dimmer desktop? Use whatever system brightness you like and just
-  run the tool again.
-- In games that let you set peak brightness, use the **FINAL ADJUSTED VALUE** the tool
+- In games that let you set peak brightness, use the **FINAL ADJUSTED VALUE** the tool prints.
+- If you manually drag the HDR content brightness slider afterwards, your change stays until the
+  next system-brightness change (then the profile value wins, if the watcher is running).
+- The watcher works without admin rights and writes a small log to
+  `%LOCALAPPDATA%\LaptopTrueHDR\watcher.log`- In games that let you set peak brightness, use the **FINAL ADJUSTED VALUE** the tool
   prints.
 - WON'T WORK IF YOU'VE USED "WINDOWS HDR CALIBRATION", DELETE ALL PROFILES CREATED BY THAT THING
 
 
 ## Known issues
 
-- **Multi-monitor is not handled.** Measurements come from DXGI adapter 0 / output 0,
-  but the slider write goes to display path 0.
-- The result of `DisplayConfigSetDeviceInfo` is not
-  checked, so if HDR is disabled on the target display the tool will print
-  confident-looking numbers while changing nothing. Confirm HDR is on first.
-
+- If your laptop's brightness WMI provider is broken (common on hybrid-GPU laptops), the tool falls
+  back to the power-plan brightness value. The watcher then detects brightness changes by polling
+  every ~5s instead of instantly.
