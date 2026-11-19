@@ -52,6 +52,7 @@ static const wchar_t* kAppName = L"LaptopTrueHDR";
 static const wchar_t* kRunKeyPath = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const wchar_t* kRunValueName = L"LaptopTrueHDR";
 static const wchar_t* kMutexName = L"Local\\LaptopTrueHDR_Watcher";
+static const wchar_t* kCalibratingMutexName = L"Local\\LaptopTrueHDR_Calibrating";
 static const wchar_t* kWatchWndClass = L"LaptopTrueHDR_WatchWnd";
 
 constexpr UINT WM_APP_BRIGHTNESS = WM_APP + 1;  // WMI brightness event fired
@@ -78,16 +79,24 @@ enum ExitCode {
 // Small utilities
 // ---------------------------------------------------------------------------
 
-// The white level is carried in thousandths of 80 nits (1000 == 80 nits). Both
-// directions round: truncating drops the .5 on odd nits and the slider value
-// stops surviving a write/read round trip.
-static int LevelToNits(unsigned int level) { return (int)((level * 80 + 500) / 1000); }
-static unsigned int NitsToLevel(int nits) { return (unsigned int)((nits * 1000 + 40) / 80); }
+// The white level is carried in thousandths of 80 nits (1000 == 80 nits,
+// 1 unit == 0.08 nits). Converting at 0.1-nit (tenths) granularity is
+// injective and survives a write/read round trip across [kMinNits, kMaxNits].
+static int LevelToTenths(unsigned int level) { return (int)std::lround(level * 80.0 / 100.0); }
+static unsigned int TenthsToLevel(int tenths) { return (unsigned int)std::lround(tenths * 100.0 / 80.0); }
+static double LevelToNits(unsigned int level) { return LevelToTenths(level) / 10.0; }
+static unsigned int NitsToLevel(double nits) { return TenthsToLevel((int)std::lround(nits * 10.0)); }
 
 static bool SelfCheck() {
-    for (int n = kMinNits; n <= kMaxNits; n++)
-        if (LevelToNits(NitsToLevel(n)) != n) return false;
+    for (int t = kMinNits * 10; t <= kMaxNits * 10; t++)
+        if (LevelToTenths(TenthsToLevel(t)) != t) return false;
     return true;
+}
+
+static std::wstring Fmt1(double v) {
+    wchar_t buf[32];
+    swprintf(buf, 32, L"%.1f", v);
+    return buf;
 }
 
 static std::string ToUtf8(const std::wstring& w) {
@@ -193,7 +202,7 @@ static void AppendLog(const std::wstring& msg) {
 
 struct Anchor {
     int pct = 0;
-    int nits = 0; 
+    double nits = 0.0;
 };
 
 struct Profile {
@@ -202,6 +211,7 @@ struct Profile {
     std::wstring edidHash;
     float basePeakNits = 0.0f;
     std::wstring calibratedAt;
+    bool ensureLuminanceBounds = false;
     std::vector<Anchor> anchors;
 };
 
@@ -228,10 +238,11 @@ static bool SaveProfile(const Profile& p, const std::wstring& path) {
     swprintf(buf, 64, L"%.1f", p.basePeakNits);
     j += L"  \"basePeakNits\": " + std::wstring(buf) + L",\n";
     j += L"  \"calibratedAt\": \"" + JsonEscape(p.calibratedAt) + L"\",\n";
+    j += L"  \"ensureLuminanceBounds\": " + std::wstring(p.ensureLuminanceBounds ? L"true" : L"false") + L",\n";
     j += L"  \"anchors\": [\n";
     for (size_t i = 0; i < p.anchors.size(); i++) {
         wchar_t row[128];
-        swprintf(row, 128, L"    {\"pct\": %d, \"nits\": %d}%s\n",
+        swprintf(row, 128, L"    {\"pct\": %d, \"nits\": %.1f}%s\n",
                  p.anchors[i].pct, p.anchors[i].nits, i + 1 < p.anchors.size() ? L"," : L"");
         j += row;
     }
@@ -282,6 +293,13 @@ struct JsonCursor {
         return true;
     }
 
+    bool ParseBool(bool* out) {
+        SkipWs();
+        if (end - p >= 4 && wcsncmp(p, L"true", 4) == 0) { p += 4; *out = true; return true; }
+        if (end - p >= 5 && wcsncmp(p, L"false", 5) == 0) { p += 5; *out = false; return true; }
+        return false;
+    }
+
     void SkipValue() {
         SkipWs();
         if (p >= end) return;
@@ -321,6 +339,7 @@ static bool LoadProfile(const std::wstring& path, Profile* out, std::wstring* er
         else if (key == L"edidHash") { c.ParseString(&p.edidHash); haveHash = true; }
         else if (key == L"basePeakNits") { double v; c.ParseNumber(&v); p.basePeakNits = (float)v; }
         else if (key == L"calibratedAt") { c.ParseString(&p.calibratedAt); }
+        else if (key == L"ensureLuminanceBounds") { c.ParseBool(&p.ensureLuminanceBounds); }
         else if (key == L"anchors") {
             if (!c.Eat(L'[')) { if (error) *error = L"Profile is corrupt: anchors not a list."; return false; }
             while (!c.Eat(L']')) {
@@ -331,7 +350,7 @@ static bool LoadProfile(const std::wstring& path, Profile* out, std::wstring* er
                     if (!c.ParseString(&k2) || !c.Eat(L':')) { if (error) *error = L"Profile is corrupt: bad anchor."; return false; }
                     double v;
                     if (k2 == L"pct") { c.ParseNumber(&v); a.pct = (int)v; }
-                    else if (k2 == L"nits") { c.ParseNumber(&v); a.nits = (int)v; }
+                    else if (k2 == L"nits") { c.ParseNumber(&v); a.nits = std::round(v * 10.0) / 10.0; }
                     else c.SkipValue();
                     if (c.Peek(L',')) c.Eat(L',');
                 }
@@ -353,8 +372,8 @@ static bool LoadProfile(const std::wstring& path, Profile* out, std::wstring* er
 }
 
 // Linear interpolation between the surrounding anchors, clamped at the ends.
-static int InterpolateHdrNits(const std::vector<Anchor>& anchors, int pct) {
-    if (anchors.empty()) return 0;
+static double InterpolateHdrNits(const std::vector<Anchor>& anchors, int pct) {
+    if (anchors.empty()) return 0.0;
     if (pct <= anchors.front().pct) return anchors.front().nits;
     if (pct >= anchors.back().pct) return anchors.back().nits;
     for (size_t i = 1; i < anchors.size(); i++) {
@@ -362,10 +381,20 @@ static int InterpolateHdrNits(const std::vector<Anchor>& anchors, int pct) {
             const Anchor& a = anchors[i - 1];
             const Anchor& b = anchors[i];
             double t = (pct - a.pct) / double(b.pct - a.pct);
-            return (int)std::lround(a.nits + t * (b.nits - a.nits));
+            return std::round((a.nits + t * (b.nits - a.nits)) * 10.0) / 10.0;
         }
     }
     return anchors.back().nits;
+}
+
+static void ComputeLuminanceBoundsPct(const std::vector<Anchor>& anchors, int* outMinPct, int* outMaxPct) {
+    if (anchors.empty()) {
+        *outMinPct = 0;
+        *outMaxPct = 100;
+        return;
+    }
+    *outMinPct = anchors.front().pct;
+    *outMaxPct = anchors.back().pct;
 }
 
 // ---------------------------------------------------------------------------
@@ -387,7 +416,8 @@ static bool GetFreshDXGIDesc(const wchar_t* preferGdiName, DXGI_OUTPUT_DESC1* ou
             if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput6), (void**)&output6))) {
                 DXGI_OUTPUT_DESC1 desc = {};
                 if (SUCCEEDED(output6->GetDesc1(&desc))) {
-                    bool isPreferred = preferGdiName && desc.DeviceName[0] && preferGdiName == desc.DeviceName;
+                    // Compare GDI device names by content (desc.DeviceName is a local array, so == would compare pointers).
+                    bool isPreferred = preferGdiName && desc.DeviceName[0] && wcscmp(preferGdiName, desc.DeviceName) == 0;
                     bool isHdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
                     if (isPreferred || !haveChosen) {
                         bool better = isPreferred ||
@@ -411,20 +441,26 @@ static bool GetFreshDXGIDesc(const wchar_t* preferGdiName, DXGI_OUTPUT_DESC1* ou
     return haveChosen;
 }
 
-// Poll until DXGI reports the same nonzero peak twice in a row so a single
-// stale read after a slider change can't poison a probe.
+// Poll until DXGI reports the same nonzero peak 3 times in a row so a stale
+// or mid-transition read after a slider change can't poison a probe.
 static float MeasureStableMaxLuminance(const wchar_t* preferGdiName) {
     const DWORD start = GetTickCount();
     float prev = 0.0f, lastNonZero = 0.0f;
+    int streak = 0;
     for (;;) {
         DXGI_OUTPUT_DESC1 desc = {};
         float v = 0.0f;
         if (GetFreshDXGIDesc(preferGdiName, &desc)) v = desc.MaxLuminance;
         if (v > lastNonZero) lastNonZero = v;
-        if (v > 0.0f && v == prev) return v;
-        prev = v;
-        if (GetTickCount() - start > 2500) return lastNonZero;
-        Sleep(120);
+        if (v > 0.0f && v == prev) {
+            streak++;
+            if (streak >= 3) return v;
+        } else {
+            prev = v;
+            streak = (v > 0.0f) ? 1 : 0;
+        }
+        if (GetTickCount() - start > 3000) return lastNonZero;
+        Sleep(100);
     }
 }
 
@@ -563,6 +599,20 @@ static bool GetBaseLuminanceFromEdid(const DXGI_OUTPUT_DESC1& desc, float* outNi
 // Display context: everything one calibration/apply pass needs
 // ---------------------------------------------------------------------------
 
+struct EdidLuminanceOverrides {
+    bool hasMax = false;
+    float maxNits = 0.0f;
+    bool hasMin = false;
+    float minNits = 0.0f;
+    bool hasFullFrameAvg = false;
+    float fullFrameAvgNits = 0.0f;
+};
+
+static bool g_hasEnsureBoundsArg = false;
+static bool g_ensureBoundsArg = false;
+
+static EdidLuminanceOverrides g_edidOverrides;
+
 struct DisplayContext {
     DXGI_OUTPUT_DESC1 desc = {};
     float baseLevel = 0.0f;   // EDID hardware peak in nits
@@ -584,10 +634,14 @@ static int InitDisplayContext(DisplayContext* ctx, bool quiet) {
     }
     ctx->desc = desc;
 
-    std::wstring edidError;
-    if (!GetBaseLuminanceFromEdid(desc, &ctx->baseLevel, &edidError)) {
-        if (!quiet) std::wcout << L"[-] Unable to proceed: " << edidError << L"\n";
-        return ExitDisplayError;
+    if (g_edidOverrides.hasMax) {
+        ctx->baseLevel = g_edidOverrides.maxNits;
+    } else {
+        std::wstring edidError;
+        if (!GetBaseLuminanceFromEdid(desc, &ctx->baseLevel, &edidError)) {
+            if (!quiet) std::wcout << L"[-] Unable to proceed: " << edidError << L"\n";
+            return ExitDisplayError;
+        }
     }
 
     if (!FindPathForGdiDevice(desc.DeviceName, &ctx->adapterId, &ctx->targetId)) {
@@ -604,7 +658,7 @@ static int InitDisplayContext(DisplayContext* ctx, bool quiet) {
 // SDR white level read / write
 // ---------------------------------------------------------------------------
 
-static bool GetCurrentSliderNits(LUID adapterId, UINT32 targetId, int* nits) {
+static bool GetCurrentSliderNits(LUID adapterId, UINT32 targetId, double* nits) {
     DISPLAYCONFIG_SDR_WHITE_LEVEL whiteLevel = {};
     whiteLevel.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
     whiteLevel.header.size = sizeof(whiteLevel);
@@ -616,7 +670,7 @@ static bool GetCurrentSliderNits(LUID adapterId, UINT32 targetId, int* nits) {
     return true;
 }
 
-static LONG WriteSDRWhiteLevel(LUID adapterId, UINT32 targetId, int nits) {
+static LONG WriteSDRWhiteLevel(LUID adapterId, UINT32 targetId, double nits) {
     _DISPLAYCONFIG_SET_SDR_WHITE_LEVEL sdrWhiteParams = {};
     sdrWhiteParams.header.type = DISPLAYCONFIG_DEVICE_INFO_SET_SDR_WHITE_LEVEL;
     sdrWhiteParams.header.size = sizeof(sdrWhiteParams);
@@ -628,15 +682,15 @@ static LONG WriteSDRWhiteLevel(LUID adapterId, UINT32 targetId, int nits) {
     return DisplayConfigSetDeviceInfo(&sdrWhiteParams.header);
 }
 
-static bool WriteAndVerify(const DisplayContext& ctx, int nits, int* appliedNits) {
+static bool WriteAndVerify(const DisplayContext& ctx, double nits, double* appliedNits) {
     for (int attempt = 0; attempt < 2; attempt++) {
         LONG hr = WriteSDRWhiteLevel(ctx.adapterId, ctx.targetId, nits);
         if (hr != ERROR_SUCCESS) {
             std::wcout << L"  [!] Slider write failed (error " << hr << L")\n";
             continue;
         }
-        int read = 0;
-        if (GetCurrentSliderNits(ctx.adapterId, ctx.targetId, &read) && std::abs(read - nits) <= 1) {
+        double read = 0.0;
+        if (GetCurrentSliderNits(ctx.adapterId, ctx.targetId, &read) && std::abs(read - nits) <= 0.15) {
             if (appliedNits) *appliedNits = read;
             return true;
         }
@@ -836,10 +890,25 @@ private:
     bool wmiOk_ = true;
 };
 
-static bool WaitBrightness(Brightness& brightness, int targetPct) {
+static bool WaitBrightness(Brightness& brightness, int targetPct, int* actualPct = nullptr, bool allowSnap = false) {
+    int last = -1;
+    int stable = 0;
     for (int i = 0; i < 20; i++) {
         int v = -1;
-        if (brightness.GetPct(&v) && v == targetPct) return true;
+        if (brightness.GetPct(&v)) {
+            if (v == targetPct) {
+                if (actualPct) *actualPct = v;
+                return true;
+            }
+            if (allowSnap) {
+                if (v == last) stable++;
+                else { last = v; stable = 1; }
+                if (stable >= 3 && std::abs(v - targetPct) <= 5) {
+                    if (actualPct) *actualPct = v;
+                    return true;
+                }
+            }
+        }
         Sleep(100);
     }
     return false;
@@ -851,7 +920,8 @@ static bool WaitBrightness(Brightness& brightness, int targetPct) {
 
 struct BisectResult {
     bool failed = false;
-    int bestNits = 0;
+    bool outOfBounds = false;
+    double bestNits = 0.0;
     float measured = 0.0f;   // adjusted peak at bestNits
     const wchar_t* note = nullptr;  // floor/ceiling notice, if any
 };
@@ -861,40 +931,61 @@ static BisectResult BisectAtCurrentBrightness(const DisplayContext& ctx) {
     const wchar_t* gdi = ctx.desc.DeviceName;
     float base = ctx.baseLevel;
 
-    auto probe = [&](int nits) {
-        int applied = 0;
+    auto probe = [&](int tenths) {
+        double nits = tenths / 10.0;
+        double applied = 0.0;
         if (!WriteAndVerify(ctx, nits, &applied)) return 0.0f;
-        Sleep(150);
+        Sleep(200);
         float measured = MeasureStableMaxLuminance(gdi);
-        std::wcout << L"  Testing Slider: " << nits
-                   << L" Nits | Adjusted Level: " << measured
-                   << L" Nits | Factor: " << (measured > 0.0f ? base / measured : 0.0f) << L"\n";
+        wchar_t line[160];
+        swprintf(line, 160,
+                 L"  Testing Slider: %5.1f Nits | Adjusted Level: %6.1f Nits | Factor: %.4f\n",
+                 nits, measured, measured > 0.0f ? base / measured : 0.0f);
+        std::wcout << line;
         return measured;
     };
 
-    int lo = kMinNits, hi = kMaxNits;
+    int lo = kMinNits * 10, hi = kMaxNits * 10;
     float loVal = probe(lo), hiVal = probe(hi);
     if (loVal <= 0.0f || hiVal <= 0.0f) {
         r.failed = true;
         return r;
     }
 
-    if (loVal >= base) {
-        r.bestNits = lo;
+    if (loVal > base) {
+        r.outOfBounds = true;
+        r.bestNits = lo / 10.0;
         r.measured = loVal;
-        r.note = L"already at or above the target at the minimum slider value";
+        r.note = L"overshoots: already above target at minimum slider (80.0 Nits)";
+        return r;
+    }
+    if (loVal == base) {
+        r.bestNits = lo / 10.0;
+        r.measured = loVal;
         return r;
     }
     if (hiVal < base) {
-        r.bestNits = hi;
+        r.outOfBounds = true;
+        r.bestNits = hi / 10.0;
         r.measured = hiVal;
-        r.note = L"slider ceiling reached before matching the hardware peak";
+        r.note = L"undershoots: slider ceiling (400.0 Nits) reached before matching peak";
         return r;
     }
 
     while (hi - lo > 1) {
         int mid = (lo + hi) / 2;
         float measured = probe(mid);
+        // DXGI MaxLuminance is monotonically increasing with the slider; re-read if a
+        // mid-transition/stale reading falls outside [loVal, hiVal].
+        for (int retry = 0; retry < 3 && measured > 0.0f && (measured < loVal || measured > hiVal); retry++) {
+            Sleep(250);
+            measured = MeasureStableMaxLuminance(gdi);
+            wchar_t line[160];
+            swprintf(line, 160,
+                     L"  Re-read Slider: %5.1f Nits | Adjusted Level: %6.1f Nits | Factor: %.4f\n",
+                     mid / 10.0, measured, measured > 0.0f ? base / measured : 0.0f);
+            std::wcout << line;
+        }
         if (measured <= 0.0f) {
             r.failed = true;
             return r;
@@ -902,8 +993,9 @@ static BisectResult BisectAtCurrentBrightness(const DisplayContext& ctx) {
         if (measured < base) { lo = mid; loVal = measured; }
         else                 { hi = mid; hiVal = measured; }
     }
-    r.bestNits = (std::abs(loVal - base) <= std::abs(hiVal - base)) ? lo : hi;
-    r.measured = (r.bestNits == lo) ? loVal : hiVal;
+    int bestTenths = (std::abs(loVal - base) <= std::abs(hiVal - base)) ? lo : hi;
+    r.bestNits = bestTenths / 10.0;
+    r.measured = (bestTenths == lo) ? loVal : hiVal;
     return r;
 }
 
@@ -912,12 +1004,11 @@ static BisectResult BisectAtCurrentBrightness(const DisplayContext& ctx) {
 // ---------------------------------------------------------------------------
 
 static void PrintHeader(const DisplayContext& ctx) {
-    int current = 0;
+    double current = 0.0;
     GetCurrentSliderNits(ctx.adapterId, ctx.targetId, &current);
-    std::wcout << L"[Base Level Found] (Hardware Peak): " << ctx.baseLevel << L" Nits\n";
-    std::wcout << L"[Panel]                            : " << ctx.monitorName << L"\n";
-    std::wcout << L"[Current HDR Content Brightness]   : " << current << L" Nits\n";
-    std::wcout << L"[*] Initializing calibration...\n\n";
+    std::wcout << L"[Base Level Found] (Hardware Peak) : " << Fmt1(ctx.baseLevel) << L" Nits\n";
+    std::wcout << L"[Panel]                           : " << ctx.monitorName << L"\n";
+    std::wcout << L"[Current HDR Content Brightness]  : " << Fmt1(current) << L" Nits\n";
 }
 
 static int CheckHdrForCalibration(const DisplayContext& ctx) {
@@ -936,6 +1027,7 @@ static int RunQuick() {
     if (rc) return rc;
 
     PrintHeader(ctx);
+    std::wcout << L"[*] Initializing calibration...\n\n";
 
     BisectResult r = BisectAtCurrentBrightness(ctx);
     if (r.failed) {
@@ -945,31 +1037,41 @@ static int RunQuick() {
     if (r.note) std::wcout << L"\n[!] " << r.note << L".\n";
     else std::wcout << L"\n[*] Optimal value identified for current system brightness.\n";
 
-    int applied = 0;
+    double applied = 0.0;
     if (!WriteAndVerify(ctx, r.bestNits, &applied)) {
         std::wcout << L"[-] Failed to set the final slider value.\n";
         return ExitWriteFailed;
     }
-    Sleep(150);
+
     float finalAdjusted = MeasureStableMaxLuminance(ctx.desc.DeviceName);
 
+    wchar_t factorBuf[32];
+    swprintf(factorBuf, 32, L"%.4f", finalAdjusted > 0.0f ? ctx.baseLevel / finalAdjusted : 0.0f);
     std::wcout << L"\n[*] Alignment Step Complete.\n";
-    std::wcout << L"    -> Selected Slider Setting: " << applied << L" Nits\n";
-    std::wcout << L"    -> Base Level: " << ctx.baseLevel << L" Nits\n";
-    std::wcout << L"    -> Final Adjusted Level: " << finalAdjusted << L" Nits\n";
-    std::wcout << L"    -> Final Slider Factor: "
-               << (finalAdjusted > 0.0f ? ctx.baseLevel / finalAdjusted : 0.0f) << L"\n";
+    std::wcout << L"    -> Selected Slider Setting : " << Fmt1(applied) << L" Nits\n";
+    std::wcout << L"    -> Base Level              : " << Fmt1(ctx.baseLevel) << L" Nits\n";
+    std::wcout << L"    -> Final Adjusted Level    : " << Fmt1(finalAdjusted) << L" Nits\n";
+    std::wcout << L"    -> Final Slider Factor     : " << factorBuf << L"\n";
     std::wcout << L"    In games that ask for a peak brightness, use the FINAL ADJUSTED VALUE above.\n";
     return ExitOk;
 }
 
-// --map (default): calibrate the whole brightness range and save the profile.
-static int RunMap() {
+static bool IsWatcherRunning();
+
+// --map / --calibrate-slow: calibrate the brightness range and save the profile.
+static int RunMap(bool slow = false) {
     DisplayContext ctx;
     int rc = InitDisplayContext(&ctx, false);
     if (rc) return rc;
     rc = CheckHdrForCalibration(ctx);
     if (rc) return rc;
+
+    if (IsWatcherRunning()) {
+        std::wcout << L"[!] Note: a background watcher is currently running. If it is an older\n";
+        std::wcout << L"    build, stop it in Task Manager so it does not overwrite the slider\n";
+        std::wcout << L"    during calibration.\n\n";
+    }
+    HANDLE calMutex = CreateMutexW(nullptr, TRUE, kCalibratingMutexName);
 
     Brightness brightness;
     int originalPct = 0;
@@ -980,66 +1082,114 @@ static int RunMap() {
     }
 
     PrintHeader(ctx);
-    std::wcout << L"[Current System Brightness]        : " << originalPct << L"%\n";
-    std::wcout << L"[*] Calibrating at system brightness anchors: 10/30/50/70/90%.\n\n";
+    std::wcout << L"[Current System Brightness]       : " << originalPct << L"%\n";
+    std::wcout << L"[*] Initializing calibration...\n";
+    if (slow) {
+        std::wcout << L"[*] Calibrating all system brightness levels (0-100%, slow mode).\n\n";
+    } else {
+        std::wcout << L"[*] Calibrating at system brightness anchors: 10/30/50/70/90%.\n\n";
+    }
+
+    std::vector<int> targets;
+    if (slow) {
+        targets.reserve(101);
+        for (int p = 0; p <= 100; p++) targets.push_back(p);
+    } else {
+        for (int p : kAnchorPcts) targets.push_back(p);
+    }
 
     Profile profile;
+    {
+        Profile existing;
+        std::wstring ignore;
+        if (LoadProfile(ProfilePath(), &existing, &ignore)) {
+            profile.ensureLuminanceBounds = existing.ensureLuminanceBounds;
+        }
+    }
+    if (g_hasEnsureBoundsArg) {
+        profile.ensureLuminanceBounds = g_ensureBoundsArg;
+    }
     profile.deviceName = ctx.monitorName;
     profile.edidHash = ctx.edidHash;
     profile.basePeakNits = ctx.baseLevel;
     profile.calibratedAt = NowString();
 
     bool brightnessChanged = false;
-    for (int pct : kAnchorPcts) {
-        if (!brightness.SetPct(pct) || !WaitBrightness(brightness, pct)) {
+    for (int pct : targets) {
+        int actualPct = pct;
+        if (!brightness.SetPct(pct) || !WaitBrightness(brightness, pct, &actualPct, slow)) {
             std::wcout << L"[-] Could not set system brightness to " << pct << L"%. Aborting.\n";
             rc = ExitGeneric;
             break;
         }
         brightnessChanged = true;
+        if (slow && !profile.anchors.empty() && profile.anchors.back().pct == actualPct) {
+            continue;  // hardware snapped to an already-calibrated level
+        }
         Sleep(300);  // panel transition
-        std::wcout << L"[System Brightness " << pct << L"%]\n";
+        std::wcout << L"[System Brightness " << actualPct << L"%]\n";
         BisectResult r = BisectAtCurrentBrightness(ctx);
         if (r.failed) {
-            std::wcout << L"[-] Measurement failed at " << pct << L"% brightness. Aborting.\n";
+            std::wcout << L"[-] Measurement failed at " << actualPct << L"% brightness. Aborting.\n";
             rc = ExitGeneric;
             break;
         }
-        profile.anchors.push_back({pct, r.bestNits});
-        std::wcout << L"  -> HDR content brightness: " << r.bestNits << L" nits"
-                   << L" (adjusted peak " << r.measured << L")";
-        if (r.note) std::wcout << L" [" << r.note << L"]";
-        std::wcout << L"\n\n";
+        if (r.outOfBounds) {
+            std::wcout << L"  -> Skipped (out of bounds): " << r.note
+                       << L" (adjusted peak " << Fmt1(r.measured) << L" Nits)\n\n";
+        } else {
+            profile.anchors.push_back({actualPct, r.bestNits});
+            std::wcout << L"  -> HDR content brightness : " << Fmt1(r.bestNits) << L" Nits"
+                       << L" (adjusted peak " << Fmt1(r.measured) << L" Nits)\n\n";
+        }
     }
 
     if (brightnessChanged) {
         brightness.SetPct(originalPct);
         WaitBrightness(brightness, originalPct);
     }
+    if (calMutex) CloseHandle(calMutex);
     if (rc) return rc;
+
+    if (profile.anchors.empty()) {
+        std::wcout << L"[-] No system brightness levels matched the target peak luminance within 80.0-400.0 Nits.\n";
+        std::wcout << L"    Profile was not saved.\n";
+        return ExitGeneric;
+    }
 
     if (!SaveProfile(profile, ProfilePath())) {
         std::wcout << L"[-] Failed to write the profile to " << ProfilePath() << L"\n";
         return ExitGeneric;
     }
 
+    int minPct = 0, maxPct = 100;
+    ComputeLuminanceBoundsPct(profile.anchors, &minPct, &maxPct);
+
     // Leave the system at the best pair for the user's current brightness.
-    int nits = InterpolateHdrNits(profile.anchors, originalPct);
-    int applied = 0;
+    double nits = InterpolateHdrNits(profile.anchors, originalPct);
+    double applied = 0.0;
     if (WriteAndVerify(ctx, nits, &applied)) {
         std::wcout << L"[*] Applied HDR content brightness for current system brightness ("
-                   << originalPct << L"%): " << applied << L" nits\n";
+                   << originalPct << L"%): " << Fmt1(applied) << L" Nits\n";
     } else {
         std::wcout << L"[!] Profile saved, but applying the value for the current brightness failed.\n";
         std::wcout << L"    Run --apply to retry.\n";
         return ExitWriteFailed;
     }
 
-    std::wcout << L"\n[+] Profile saved: " << ProfilePath() << L"\n";
-    std::wcout << L"    Your accurate combo: system brightness " << originalPct
-               << L"% + HDR content brightness " << applied << L" nits.\n";
-    std::wcout << L"    Install the watcher (hdr-laptop-calibration.exe --install) to keep HDR\n";
-    std::wcout << L"    aligned automatically whenever the system brightness changes.\n";
+    std::wcout << L"\n[+] Calibration Complete\n";
+    std::wcout << L"    Profile Path         : " << ProfilePath() << L"\n";
+    std::wcout << L"    Valid Anchors Saved  : " << profile.anchors.size() << L"\n";
+    std::wcout << L"    Valid HDR Bounds     : " << minPct << L"% - " << maxPct << L"% system brightness\n";
+    std::wcout << L"    Ensure Bounds        : " << (profile.ensureLuminanceBounds ? L"on" : L"off")
+               << L" (toggle with --ensure-luminance-bounds on | off)\n";
+    if (originalPct < minPct || originalPct > maxPct) {
+        std::wcout << L"    [!] Current system brightness (" << originalPct
+                   << L"%) is outside the valid HDR bounds (" << minPct << L"%-" << maxPct << L"%).\n";
+    }
+    std::wcout << L"    Current Combo        : system brightness " << originalPct
+               << L"% + HDR content brightness " << Fmt1(applied) << L" Nits\n";
+    std::wcout << L"    Watcher              : run --install to keep HDR aligned automatically.\n";
     return ExitOk;
 }
 
@@ -1073,14 +1223,36 @@ static int RunApply() {
         return ExitGeneric;
     }
 
-    int nits = InterpolateHdrNits(profile.anchors, pct);
-    int applied = 0;
+    int minPct = 0, maxPct = 100;
+    ComputeLuminanceBoundsPct(profile.anchors, &minPct, &maxPct);
+    if (pct < minPct || pct > maxPct) {
+        if (profile.ensureLuminanceBounds) {
+            int clampedPct = (pct < minPct) ? minPct : maxPct;
+            int actualPct = clampedPct;
+            if (brightness.SetPct(clampedPct)) {
+                WaitBrightness(brightness, clampedPct, &actualPct, true);
+                std::wcout << L"[*] System brightness " << pct << L"% was outside valid HDR bounds ("
+                           << minPct << L"%-" << maxPct << L"%); adjusted to " << actualPct << L"%.\n";
+                pct = actualPct;
+            } else {
+                std::wcout << L"[!] Could not clamp system brightness " << pct << L"% to ["
+                           << minPct << L"%-" << maxPct << L"%].\n";
+            }
+        } else {
+            std::wcout << L"[!] System brightness " << pct << L"% is outside the valid HDR bounds ("
+                       << minPct << L"%-" << maxPct << L"%); clamping to nearest endpoint.\n";
+        }
+    }
+
+    double nits = InterpolateHdrNits(profile.anchors, pct);
+    double applied = 0.0;
     if (!WriteAndVerify(ctx, nits, &applied)) {
         std::wcout << L"[-] Failed to set the HDR content brightness.\n";
         return ExitWriteFailed;
     }
     std::wcout << L"[+] System brightness " << pct << L"% -> HDR content brightness "
-               << applied << L" nits (panel peak " << profile.basePeakNits << L" nits).\n";
+               << Fmt1(applied) << L" Nits (panel peak " << Fmt1(profile.basePeakNits)
+               << L" Nits, valid bounds " << minPct << L"%-" << maxPct << L"%).\n";
     return ExitOk;
 }
 
@@ -1103,6 +1275,12 @@ static WatchState* g_watch = nullptr;
 static void ApplyFromProfile(const wchar_t* reason) {
     WatchState& s = *g_watch;
 
+    if (HANDLE cal = OpenMutexW(SYNCHRONIZE, FALSE, kCalibratingMutexName)) {
+        CloseHandle(cal);
+        AppendLog(std::wstring(L"[apply] skipped (") + reason + L"): calibration in progress.");
+        return;
+    }
+
     DXGI_OUTPUT_DESC1 desc = {};
     if (GetFreshDXGIDesc(s.ctx.desc.DeviceName, &desc) && !IsHdrActive(desc)) {
         AppendLog(std::wstring(L"[apply] skipped (") + reason + L"): HDR is off.");
@@ -1115,15 +1293,35 @@ static void ApplyFromProfile(const wchar_t* reason) {
         return;
     }
 
-    int nits = InterpolateHdrNits(s.profile.anchors, pct);
-    int applied = 0;
+    if (s.profile.ensureLuminanceBounds) {
+        int minPct = 0, maxPct = 100;
+        ComputeLuminanceBoundsPct(s.profile.anchors, &minPct, &maxPct);
+        int clampedPct = (pct < minPct) ? minPct : (pct > maxPct ? maxPct : pct);
+        if (clampedPct != pct) {
+            int actualPct = clampedPct;
+            if (s.brightness.SetPct(clampedPct)) {
+                WaitBrightness(s.brightness, clampedPct, &actualPct, true);
+                AppendLog(L"[bounds] system brightness " + std::to_wstring(pct)
+                          + L"% outside HDR calibration bounds [" + std::to_wstring(minPct)
+                          + L"%-" + std::to_wstring(maxPct) + L"%]; adjusted to "
+                          + std::to_wstring(actualPct) + L"%.");
+                pct = actualPct;
+            } else {
+                AppendLog(L"[bounds] failed to clamp system brightness " + std::to_wstring(pct)
+                          + L"% to [" + std::to_wstring(minPct) + L"%-" + std::to_wstring(maxPct) + L"%].");
+            }
+        }
+    }
+
+    double nits = InterpolateHdrNits(s.profile.anchors, pct);
+    double applied = 0.0;
     if (!WriteAndVerify(s.ctx, nits, &applied)) {
-        AppendLog(L"[apply] FAILED: slider write did not land (target " + std::to_wstring(nits) + L" nits).");
+        AppendLog(L"[apply] FAILED: slider write did not land (target " + Fmt1(nits) + L" Nits).");
         return;
     }
     s.lastBrightnessPct = pct;
     AppendLog(L"[apply] system brightness " + std::to_wstring(pct) + L"% -> HDR content brightness "
-              + std::to_wstring(applied) + L" nits (verified) [" + reason + L"]");
+              + Fmt1(applied) + L" Nits (verified) [" + reason + L"]");
 }
 
 // Rebuild the display context after resume/topology change and re-apply once.
@@ -1258,8 +1456,12 @@ static int RunWatch() {
 
     SetTimer(state.hwnd, 2, kPollFallbackMs, nullptr);
 
-    AppendLog(L"[watch] started. Panel peak " + std::to_wstring((int)(profile.basePeakNits + 0.5f))
-              + L" nits, " + std::to_wstring(profile.anchors.size()) + L" calibration anchors.");
+    int minPct = 0, maxPct = 100;
+    ComputeLuminanceBoundsPct(profile.anchors, &minPct, &maxPct);
+    AppendLog(L"[watch] started. Panel peak " + Fmt1(profile.basePeakNits)
+              + L" Nits, " + std::to_wstring(profile.anchors.size()) + L" calibration anchors, "
+              + L"valid bounds " + std::to_wstring(minPct) + L"%-" + std::to_wstring(maxPct) + L"%, "
+              + L"ensureLuminanceBounds=" + (profile.ensureLuminanceBounds ? L"on" : L"off") + L".");
 
     ApplyFromProfile(L"startup");
 
@@ -1370,11 +1572,18 @@ static int RunStatus() {
     Profile profile;
     std::wstring path = ProfilePath();
     if (LoadProfile(path, &profile, &error)) {
+        int minPct = 0, maxPct = 100;
+        ComputeLuminanceBoundsPct(profile.anchors, &minPct, &maxPct);
         std::wcout << L"Profile    : VALID (" << profile.calibratedAt << L", panel peak "
-                   << profile.basePeakNits << L" nits, " << profile.anchors.size() << L" anchors)\n";
+                   << Fmt1(profile.basePeakNits) << L" Nits, " << profile.anchors.size() << L" anchors)\n";
         std::wcout << L"             " << path << L"\n";
-        for (const Anchor& a : profile.anchors)
-            std::wcout << L"             system " << a.pct << L"% -> HDR " << a.nits << L" nits\n";
+        for (const Anchor& a : profile.anchors) {
+            wchar_t row[96];
+            swprintf(row, 96, L"             system %3d%% -> HDR %5.1f Nits\n", a.pct, a.nits);
+            std::wcout << row;
+        }
+        std::wcout << L"Bounds     : " << (profile.ensureLuminanceBounds ? L"on" : L"off")
+                   << L" (valid HDR range " << minPct << L"% - " << maxPct << L"%)\n";
     } else {
         std::wcout << L"Profile    : INVALID — " << error << L"\n";
     }
@@ -1403,21 +1612,199 @@ static int RunStatus() {
     return ExitOk;
 }
 
-static int RunHelp() {
-    std::wcout << L"LaptopTrueHDR — automatic HDR calibration for laptop internal displays.\n\n";
-    std::wcout << L"Usage: hdr-laptop-calibration.exe [mode]\n\n";
-    std::wcout << L"  (no args) / --map   Calibrate the whole brightness range (10-90% anchors),\n";
-    std::wcout << L"                      save the profile, apply the value for the current\n";
-    std::wcout << L"                      system brightness. Takes about a minute; your screen\n";
-    std::wcout << L"                      will step through brightness levels and return.\n";
-    std::wcout << L"  --quick             Calibrate only for the current system brightness.\n";
-    std::wcout << L"  --apply             Apply the saved profile for the current brightness.\n";
-    std::wcout << L"  --watch             Run the background watcher (re-applies HDR brightness\n";
-    std::wcout << L"                      when system brightness changes).\n";
-    std::wcout << L"  --install           Start the watcher now and automatically at logon.\n";
-    std::wcout << L"  --uninstall         Remove the autostart entry.\n";
-    std::wcout << L"  --status            Show profile, panel, autostart and watcher state.\n";
+static int RunEdid() {
+    DXGI_OUTPUT_DESC1 desc = {};
+    if (!GetFreshDXGIDesc(nullptr, &desc)) {
+        std::wcout << L"[-] Unable to query the display through DXGI.\n";
+        return ExitDisplayError;
+    }
+
+    std::wcout << L"DXGI Output   : " << desc.DeviceName << L"\n";
+    std::wcout << L"EDID Hash     : " << ComputeEdidHash(desc) << L"\n\n";
+
+    DISPLAY_DEVICEW device = {};
+    device.cb = sizeof(device);
+    bool foundAny = false;
+    for (UINT i = 0; EnumDisplayDevicesW(desc.DeviceName, i, &device, EDD_GET_DEVICE_INTERFACE_NAME); i++) {
+        if (!(device.StateFlags & DISPLAY_DEVICE_ACTIVE)) continue;
+        foundAny = true;
+
+        std::wcout << L"Device String : " << device.DeviceString << L"\n";
+        std::wcout << L"Device ID     : " << device.DeviceID << L"\n";
+
+        try {
+            DisplayMonitor monitor = DisplayMonitor::FromInterfaceIdAsync(winrt::to_hstring(device.DeviceID)).get();
+            if (monitor) {
+                std::wcout << L"Display Name  : " << monitor.DisplayName().c_str() << L"\n";
+                auto res = monitor.NativeResolutionInRawPixels();
+                std::wcout << L"Native Res    : " << res.Width << L" x " << res.Height << L"\n";
+                if (auto phys = monitor.PhysicalSizeInInches()) {
+                    auto sz = phys.Value();
+                    wchar_t buf[64];
+                    swprintf(buf, 64, L"%.2f x %.2f in", sz.Width, sz.Height);
+                    std::wcout << L"Physical Size : " << buf << L"\n";
+                }
+                float minLum = g_edidOverrides.hasMin ? g_edidOverrides.minNits : monitor.MinLuminanceInNits();
+                float maxLum = g_edidOverrides.hasMax ? g_edidOverrides.maxNits : monitor.MaxLuminanceInNits();
+                float avgLum = g_edidOverrides.hasFullFrameAvg ? g_edidOverrides.fullFrameAvgNits : monitor.MaxAverageFullFrameLuminanceInNits();
+                bool anyOverride = g_edidOverrides.hasMin || g_edidOverrides.hasMax || g_edidOverrides.hasFullFrameAvg;
+                wchar_t lumBuf[160];
+                swprintf(lumBuf, 160, L"min %.4f, max %.1f, maxAvgFullFrame %.1f nits%s",
+                         minLum, maxLum, avgLum, anyOverride ? L" [overridden]" : L"");
+                std::wcout << L"Luminance     : " << lumBuf << L"\n";
+                auto wp = monitor.WhitePoint();
+                auto rp = monitor.RedPrimary();
+                auto gp = monitor.GreenPrimary();
+                auto bp = monitor.BluePrimary();
+                wchar_t colBuf[256];
+                swprintf(colBuf, 256,
+                         L"W(%.4f, %.4f) R(%.4f, %.4f) G(%.4f, %.4f) B(%.4f, %.4f)",
+                         wp.X, wp.Y, rp.X, rp.Y, gp.X, gp.Y, bp.X, bp.Y);
+                std::wcout << L"Chromaticity  : " << colBuf << L"\n";
+            }
+        } catch (winrt::hresult_error const& e) {
+            std::wcout << L"DisplayMonitor: unavailable (" << e.message().c_str() << L")\n";
+        } catch (...) {
+            std::wcout << L"DisplayMonitor: unavailable\n";
+        }
+
+        std::vector<unsigned char> edid;
+        std::wstring enumPath = MonitorEnumPathFromDeviceId(device.DeviceID);
+        if (!enumPath.empty()) {
+            std::wstring regKey = L"SYSTEM\\CurrentControlSet\\Enum\\" + enumPath + L"\\Device Parameters";
+            HKEY key = nullptr;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, regKey.c_str(), 0, KEY_READ, &key) == ERROR_SUCCESS) {
+                DWORD size = 0;
+                if (RegGetValueW(HKEY_LOCAL_MACHINE, regKey.c_str(), L"EDID", RRF_RT_REG_BINARY,
+                                 nullptr, nullptr, &size) == ERROR_SUCCESS && size > 0 && size < 4096) {
+                    edid.resize(size);
+                    DWORD got = size;
+                    if (RegGetValueW(HKEY_LOCAL_MACHINE, regKey.c_str(), L"EDID", RRF_RT_REG_BINARY,
+                                     nullptr, edid.data(), &got) == ERROR_SUCCESS && got > 0) {
+                        edid.resize(got);
+                    } else {
+                        edid.clear();
+                    }
+                }
+                RegCloseKey(key);
+            }
+        }
+
+        if (edid.size() >= 128) {
+            unsigned short mfgRaw = (unsigned short)((edid[8] << 8) | edid[9]);
+            wchar_t mfg[4] = {
+                (wchar_t)(L'@' + ((mfgRaw >> 10) & 0x1F)),
+                (wchar_t)(L'@' + ((mfgRaw >> 5) & 0x1F)),
+                (wchar_t)(L'@' + (mfgRaw & 0x1F)),
+                0
+            };
+            unsigned short prodCode = (unsigned short)(edid[10] | (edid[11] << 8));
+            unsigned int serial = (unsigned int)(edid[12] | (edid[13] << 8) | (edid[14] << 16) | (edid[15] << 24));
+            wchar_t hdrBuf[160];
+            swprintf(hdrBuf, 160,
+                     L"Mfg=%s, Product=0x%04X, Serial=0x%08X, Week=%u, Year=%u, EDID=%u.%u, ExtBlocks=%u",
+                     mfg, prodCode, serial, edid[16], 1990u + edid[17], edid[18], edid[19], edid[126]);
+            std::wcout << L"EDID Header   : " << hdrBuf << L"\n";
+        }
+
+        if (!edid.empty()) {
+            std::wcout << L"Raw EDID (" << edid.size() << L" bytes):\n";
+            for (size_t off = 0; off < edid.size(); off += 16) {
+                if (off > 0 && (off % 128) == 0) std::wcout << L"  --- Extension Block " << (off / 128) << L" ---\n";
+                wchar_t line[128];
+                int pos = swprintf(line, 128, L"  %04zX: ", off);
+                for (size_t k = 0; k < 16 && off + k < edid.size(); k++) {
+                    pos += swprintf(line + pos, 128 - pos, L"%02X ", edid[off + k]);
+                }
+                std::wcout << line << L"\n";
+            }
+        } else {
+            std::wcout << L"Raw EDID      : not found in registry.\n";
+        }
+        std::wcout << L"\n";
+    }
+
+    if (!foundAny) {
+        std::wcout << L"[-] No active display device found for " << desc.DeviceName << L".\n";
+        return ExitDisplayError;
+    }
     return ExitOk;
+}
+
+static int RunEnsureLuminanceBounds(bool enabled) {
+    Profile profile;
+    std::wstring error;
+    std::wstring path = ProfilePath();
+    if (!LoadProfile(path, &profile, &error)) {
+        std::wcout << L"[-] " << error << L"\n";
+        return ExitProfileInvalid;
+    }
+    profile.ensureLuminanceBounds = enabled;
+    if (!SaveProfile(profile, path)) {
+        std::wcout << L"[-] Failed to write the profile to " << path << L"\n";
+        return ExitGeneric;
+    }
+    int minPct = 0, maxPct = 100;
+    ComputeLuminanceBoundsPct(profile.anchors, &minPct, &maxPct);
+    std::wcout << L"[+] ensureLuminanceBounds set to " << (enabled ? L"on" : L"off")
+               << L" (valid HDR range " << minPct << L"%-" << maxPct << L"%).\n";
+    if (IsWatcherRunning()) {
+        std::wcout << L"    Note: restart the watcher for a running instance to pick up the change.\n";
+    }
+    return ExitOk;
+}
+
+static int RunHelp() {
+    std::wcout << L"LaptopTrueHDR — keeps laptop HDR peak brightness accurate as you change screen brightness.\n\n";
+    std::wcout << L"Usage: hdr-laptop-calibration.exe [mode] [options]\n\n";
+    std::wcout << L"Quick Start:\n";
+    std::wcout << L"  1. Turn HDR ON in Windows Settings -> System -> Display.\n";
+    std::wcout << L"  2. Run with no args (or --map) to calibrate and save your screen's profile.\n";
+    std::wcout << L"  3. Run --install so HDR stays accurate automatically whenever you adjust brightness.\n\n";
+    std::wcout << L"Calibration:\n";
+    std::wcout << L"  (no args)         If you already have a profile, applies it for your current brightness\n";
+    std::wcout << L"                    and exits. If not, runs fast --map calibration.\n";
+    std::wcout << L"  --map             Fast calibration (~1 min): tests 5 brightness levels (10/30/50/70/90%),\n";
+    std::wcout << L"                    saves your profile, and applies the best setting for now.\n";
+    std::wcout << L"  --calibrate-slow  Full calibration (~10-15 min): measures every brightness step (0-100%)\n";
+    std::wcout << L"                    instead of estimating between 5 points. Stop any running watcher first.\n";
+    std::wcout << L"  --quick           One-off test: calibrates only your current brightness without saving.\n\n";
+    std::wcout << L"Applying & Background Watcher:\n";
+    std::wcout << L"  --apply           Apply your saved profile for the current screen brightness.\n";
+    std::wcout << L"  --install         Start the background watcher now and auto-start it when you log in.\n";
+    std::wcout << L"  --uninstall       Stop auto-starting the watcher at logon.\n";
+    std::wcout << L"  --watch           Run the background watcher in this session (re-applies HDR ~2s after\n";
+    std::wcout << L"                    brightness changes, sleep/resume, or display changes).\n\n";
+    std::wcout << L"Inspection:\n";
+    std::wcout << L"  --status          Show your saved profile, valid HDR brightness range, and watcher status.\n";
+    std::wcout << L"  --edid            Show raw display info (EDID) and reported panel luminance.\n";
+    std::wcout << L"  --help            Show this help message.\n\n";
+    std::wcout << L"Options:\n";
+    std::wcout << L"  --ensure-luminance-bounds <on|off>\n";
+    std::wcout << L"                    Keep screen brightness inside the range where accurate HDR is possible\n";
+    std::wcout << L"                    (if you go too dim or too bright, --watch / --apply nudges it back).\n";
+    std::wcout << L"                    Saved in your profile; restart the watcher if it is already running.\n\n";
+    std::wcout << L"  --edid-override-luminance-max <nits>\n";
+    std::wcout << L"                    Use a custom peak brightness target (e.g. 1200) instead of the value\n";
+    std::wcout << L"                    reported by your display's EDID. Useful if Windows misreports peak.\n\n";
+    std::wcout << L"  --edid-override-luminance-min <nits>\n";
+    std::wcout << L"                    Override the EDID minimum luminance shown by --edid.\n\n";
+    std::wcout << L"  --edid-override-luminance-full-frame-avg <nits>\n";
+    std::wcout << L"                    Override the EDID max full-frame average luminance shown by --edid.\n\n";
+    std::wcout << L"Examples:\n";
+    std::wcout << L"  hdr-laptop-calibration.exe --map --edid-override-luminance-max 1200\n";
+    std::wcout << L"  hdr-laptop-calibration.exe --ensure-luminance-bounds on\n";
+    return ExitOk;
+}
+
+static bool ParseFloatArg(const std::wstring& s, float* out, bool allowZero) {
+    if (s.empty()) return false;
+    wchar_t* end = nullptr;
+    double v = wcstod(s.c_str(), &end);
+    if (end == s.c_str() || *end != L'\0' || !std::isfinite(v)) return false;
+    if (allowZero ? (v < 0.0) : (v <= 0.0)) return false;
+    *out = (float)v;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1428,14 +1815,84 @@ int wmain(int argc, wchar_t** argv) {
     _wsetlocale(LC_ALL, L"");
     std::wcout << std::unitbuf;  // keep wcout/wcerr ordering sane when piped
 
-    std::wstring mode = L"map";
+    std::wstring mode = L"auto";
+    bool explicitMode = false;
+    std::wstring cliError;
     for (int i = 1; i < argc; i++) {
         std::wstring arg = argv[i];
-        if (arg.rfind(L"--", 0) == 0) mode = arg.substr(2);
-        else mode = arg;
+        auto matchStrOpt = [&](const wchar_t* name, std::wstring* out) -> bool {
+            std::wstring prefixEq = std::wstring(name) + L"=";
+            if (arg == name) {
+                if (i + 1 >= argc) {
+                    cliError = std::wstring(L"Missing value for ") + name + L".";
+                    return true;
+                }
+                *out = argv[++i];
+                return true;
+            }
+            if (arg.rfind(prefixEq, 0) == 0) {
+                *out = arg.substr(prefixEq.size());
+                return true;
+            }
+            return false;
+        };
+        auto matchOpt = [&](const wchar_t* name, float* out, bool allowZero) -> bool {
+            std::wstring val;
+            if (!matchStrOpt(name, &val)) return false;
+            if (!cliError.empty()) return true;
+            if (!ParseFloatArg(val, out, allowZero)) {
+                cliError = std::wstring(L"Invalid luminance value '") + val + L"' for " + name + L".";
+            }
+            return true;
+        };
+
+        float val = 0.0f;
+        std::wstring strVal;
+        if (matchStrOpt(L"--ensure-luminance-bounds", &strVal)) {
+            if (cliError.empty()) {
+                if (strVal == L"on" || strVal == L"true" || strVal == L"1") {
+                    g_hasEnsureBoundsArg = true;
+                    g_ensureBoundsArg = true;
+                } else if (strVal == L"off" || strVal == L"false" || strVal == L"0") {
+                    g_hasEnsureBoundsArg = true;
+                    g_ensureBoundsArg = false;
+                } else {
+                    cliError = L"Invalid value '" + strVal + L"' for --ensure-luminance-bounds (use on or off).";
+                }
+            }
+        } else if (matchOpt(L"--edid-override-luminance-max", &val, false)) {
+            g_edidOverrides.hasMax = true;
+            g_edidOverrides.maxNits = val;
+        } else if (matchOpt(L"--edid-override-luminance-min", &val, true)) {
+            g_edidOverrides.hasMin = true;
+            g_edidOverrides.minNits = val;
+        } else if (matchOpt(L"--edid-override-luminance-full-frame-avg", &val, true)) {
+            g_edidOverrides.hasFullFrameAvg = true;
+            g_edidOverrides.fullFrameAvgNits = val;
+        } else if (arg.rfind(L"--", 0) == 0) {
+            mode = arg.substr(2);
+            explicitMode = true;
+        } else {
+            mode = arg;
+            explicitMode = true;
+        }
+        if (!cliError.empty()) break;
+    }
+
+    if (g_hasEnsureBoundsArg && !explicitMode) {
+        mode = L"ensure-luminance-bounds";
+    } else if (!explicitMode) {
+        Profile existing;
+        std::wstring ignore;
+        mode = LoadProfile(ProfilePath(), &existing, &ignore) ? L"apply" : L"map";
     }
 
     if (mode != L"watch") AttachStdio();
+
+    if (!cliError.empty()) {
+        std::wcout << L"[-] " << cliError << L"\n";
+        return ExitGeneric;
+    }
 
     if (!SelfCheck()) {
         std::wcout << L"[-] Internal unit-conversion self-check failed.\n";
@@ -1449,14 +1906,26 @@ int wmain(int argc, wchar_t** argv) {
                          nullptr, EOAC_NONE, nullptr);  // RPC_E_TOO_LATE is fine
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
 
+    if (g_hasEnsureBoundsArg && mode != L"ensure-luminance-bounds" && mode != L"map" && mode != L"calibrate-slow") {
+        Profile p;
+        std::wstring err;
+        if (LoadProfile(ProfilePath(), &p, &err)) {
+            p.ensureLuminanceBounds = g_ensureBoundsArg;
+            SaveProfile(p, ProfilePath());
+        }
+    }
+
     int rc = ExitGeneric;
-    if (mode == L"map")          rc = RunMap();
-    else if (mode == L"quick")   rc = RunQuick();
-    else if (mode == L"apply")   rc = RunApply();
-    else if (mode == L"watch")   rc = RunWatch();
-    else if (mode == L"install") rc = RunInstall();
-    else if (mode == L"uninstall") rc = RunUninstall();
-    else if (mode == L"status")  rc = RunStatus();
+    if (mode == L"map")                 rc = RunMap(false);
+    else if (mode == L"calibrate-slow") rc = RunMap(true);
+    else if (mode == L"quick")          rc = RunQuick();
+    else if (mode == L"apply")          rc = RunApply();
+    else if (mode == L"watch")          rc = RunWatch();
+    else if (mode == L"install")        rc = RunInstall();
+    else if (mode == L"uninstall")      rc = RunUninstall();
+    else if (mode == L"status")         rc = RunStatus();
+    else if (mode == L"edid")           rc = RunEdid();
+    else if (mode == L"ensure-luminance-bounds") rc = RunEnsureLuminanceBounds(g_ensureBoundsArg);
     else if (mode == L"help" || mode == L"h") rc = RunHelp();
     else {
         std::wcout << L"[-] Unknown mode '" << mode << L"'.\n\n";
@@ -1464,6 +1933,6 @@ int wmain(int argc, wchar_t** argv) {
         return ExitGeneric;
     }
 
-    if (mode == L"map" || mode == L"quick") Pause();
+    if (mode == L"map" || mode == L"calibrate-slow" || mode == L"quick") Pause();
     return rc;
 }
